@@ -6,12 +6,18 @@ import type {
   ConstituencyControl,
   CampaignEvent,
   StateGovernment,
+  ChiefMinisterProfile,
 } from "@/types/campaign";
 import { INDIA_REGIONS } from "@/data/india2026";
 import {
   INDIA_ASSEMBLY_CONSTITUENCIES,
   INDIA_LOK_SABHA_CONSTITUENCIES,
 } from "@/data/constituencies";
+import {
+  generateDynamicChiefMinister,
+  calculateCabinetStability,
+} from "@/engine/governance/chiefMinisters";
+import { resolvePostPollGovernmentFormation } from "@/engine/coalitions/coalitionEngine";
 
 /**
  * Nominate a party candidate in a constituency for an upcoming election.
@@ -137,15 +143,65 @@ export function simulateElection(
     const candidateScores: { partyId: string; candidateId: string; score: number }[] = [];
 
     for (const party of competingParties) {
+      // Check pre-poll coalition agreement: Did this party yield this seat to an ally?
+      let yieldedToAlly = false;
+      let isAlliedContender = false;
+
+      for (const agreement of campaign.politicalWorld.coalitionAgreements ?? []) {
+        if (agreement.electionId === election.id && agreement.status === "agreed") {
+          const designatedPartyId = agreement.allocatedSeats[seat.id];
+          if (designatedPartyId) {
+            if (designatedPartyId !== party.id && agreement.partnerPartyIds.includes(party.id)) {
+              yieldedToAlly = true;
+              break;
+            } else if (designatedPartyId === party.id) {
+              isAlliedContender = true;
+            }
+          }
+        }
+      }
+
+      if (yieldedToAlly) {
+        // Party yielded this constituency to its alliance partner
+        continue;
+      }
+
       const isPlayer = party.isPlayerParty;
       const isIncumbent = incumbent?.winningPartyId === party.id;
 
       // Base strength
       let score = (party.popularity * 0.45) + (party.organizationStrength * 0.35) + (party.electoralStrength * 0.20);
 
-      // Candidate bonus
+      // Alliance synergy bonus if this is an agreed coalition seat
+      if (isAlliedContender) {
+        score += 8;
+      }
+
+      // Candidate and organizational ground bonuses
       if (isPlayer && playerNomination) {
-        score += (playerNomination.popularity * 0.15);
+        score += (playerNomination.popularity * 0.18);
+        if (playerNomination.experience) {
+          score += (playerNomination.experience * 0.08);
+        }
+
+        // Campaign style synergy
+        if (playerNomination.campaignStyle === "grassroots") {
+          score += 5;
+        } else if (playerNomination.campaignStyle === "orator") {
+          score += (party.popularity > 50 ? 6 : 3);
+        } else if (playerNomination.campaignStyle === "money_power") {
+          score += 5;
+        } else if (playerNomination.campaignStyle === "technocrat") {
+          score += 4;
+        }
+
+        // District Office ground presence boost in this state
+        const stateOffices = (campaign.organization.offices ?? []).filter(
+          (o) => o.partyId === playerParty?.id && o.stateId === seat.stateId,
+        );
+        if (stateOffices.length > 0) {
+          score += Math.min(8, stateOffices.length * 2);
+        }
       } else if (isPlayer && !playerNomination) {
         // Did not nominate candidate in this seat
         score = 0;
@@ -168,6 +224,35 @@ export function simulateElection(
         partyId: party.id,
         candidateId,
         score,
+      });
+    }
+
+    // Process rebel candidates in this constituency (vote splitting)
+    const constituencyRebels = (election.rebels ?? []).filter(
+      (r) => r.constituencyId === seat.id,
+    );
+
+    for (const rebel of constituencyRebels) {
+      const originalPartyScoreEntry = candidateScores.find(
+        (c) => c.partyId === rebel.originalPartyId,
+      );
+
+      const splitFactor = rebel.voteSplitFactor ?? 0.25;
+      let stolenScore = 0;
+
+      if (originalPartyScoreEntry) {
+        stolenScore = Math.round(originalPartyScoreEntry.score * splitFactor);
+        originalPartyScoreEntry.score = Math.max(5, originalPartyScoreEntry.score - stolenScore);
+      }
+
+      // Rebel score consists of stolen party base + candidate popularity draw + local factor
+      const rebelPersonalDraw = Math.round((rebel.popularity * 0.3) + ((seat.constituencyNumber * 7) % 15));
+      const rebelScore = Math.max(8, stolenScore + rebelPersonalDraw);
+
+      candidateScores.push({
+        partyId: "IND",
+        candidateId: rebel.id,
+        score: rebelScore,
       });
     }
 
@@ -219,74 +304,88 @@ export function simulateElection(
     });
   }
 
-  // Determine Government Formation
-  // Sort parties by seats won
-  const seatRankings = Array.from(seatsWonMap.entries())
-    .map(([partyId, seats]) => ({
-      partyId,
-      party: campaign.politicalWorld.parties.find((p) => p.id === partyId),
-      seats,
-    }))
-    .sort((a, b) => b.seats - a.seats);
+  // Determine Government Formation via Post-Poll Resolution
+  const postPollResolution = resolvePostPollGovernmentFormation(
+    campaign,
+    election.id,
+    stateId ?? null,
+    seatsWonMap,
+    totalSeats,
+    majorityMark,
+  );
 
-  const largestParty = seatRankings[0];
-  let governmentType: StateGovernment["governmentType"] = "majority";
-  let rulingPartyId: string = largestParty?.partyId ?? "ndf";
-  let rulingAllianceId: string | null = null;
+  const governmentType = postPollResolution.governmentType;
+  const rulingPartyId = postPollResolution.rulingPartyId;
+  const rulingAllianceId = postPollResolution.rulingAllianceId;
   let cmName: string = region?.chiefMinisterName ?? "Elected Leader";
+  const largestParty = campaign.politicalWorld.parties.find((p) => p.id === rulingPartyId);
 
-  if (largestParty && largestParty.seats >= majorityMark) {
-    governmentType = "majority";
-    rulingPartyId = largestParty.partyId;
-  } else if (largestParty) {
-    // Check if alliance forms coalition
-    const largestPartyAllianceId = largestParty.party?.allianceId;
-    if (largestPartyAllianceId) {
-      const allianceMembers = campaign.politicalWorld.parties.filter(
-        (p) => p.allianceId === largestPartyAllianceId,
-      );
-      const allianceSeats = allianceMembers.reduce(
-        (sum, p) => sum + (seatsWonMap.get(p.id) ?? 0),
-        0,
-      );
-
-      if (allianceSeats >= majorityMark) {
-        governmentType = "coalition";
-        rulingPartyId = largestParty.partyId;
-        rulingAllianceId = largestPartyAllianceId;
-      } else {
-        governmentType = "minority";
-        rulingPartyId = largestParty.partyId;
-      }
-    } else {
-      governmentType = "minority";
-      rulingPartyId = largestParty.partyId;
-    }
-  }
-
-  // Update CM name if player won
-  if (rulingPartyId === playerParty?.id) {
-    const topPlayerLeader = campaign.organization.leaders.find((l) => l.partyId === playerParty.id);
-    cmName = topPlayerLeader ? topPlayerLeader.name : "Party President";
-  }
-
-  // Update State Government record if Vidhan Sabha election
+  // Update State Government record and Chief Minister if Vidhan Sabha election
   let updatedGovernments = campaign.politicalWorld.stateGovernments;
   if (stateId) {
     const govIndex = campaign.politicalWorld.stateGovernments.findIndex(
       (g) => g.stateId === stateId,
     );
+    const existingGov = govIndex >= 0 ? campaign.politicalWorld.stateGovernments[govIndex] : undefined;
+
+    let cmProfile: ChiefMinisterProfile | null = null;
+
+    if (rulingPartyId === playerParty?.id) {
+      const topPlayerLeader = campaign.organization.leaders.find((l) => l.partyId === playerParty.id);
+      cmName = topPlayerLeader ? topPlayerLeader.name : "Party President";
+      cmProfile = {
+        id: `cm-${stateId}-player`,
+        name: cmName,
+        stateId,
+        partyId: playerParty.id,
+        age: 46,
+        experience: topPlayerLeader?.experience ?? 60,
+        approvalRating: topPlayerLeader?.popularity ?? 65,
+        leaderArchetype: "charismatic_populist",
+        coalitionManagementSkill: 75,
+        tenureDays: 1,
+        avatarSeed: `${stateId}-${cmName.replace(/\s+/g, "_")}`,
+        bio: `${cmName} of ${playerParty.name} leads the newly formed government in ${region?.name ?? stateId}.`,
+      };
+    } else if (existingGov?.rulingPartyId === rulingPartyId && existingGov.chiefMinister) {
+      // Party retained power: keep existing CM with popularity boost
+      cmProfile = {
+        ...existingGov.chiefMinister,
+        approvalRating: Math.min(95, existingGov.chiefMinister.approvalRating + 4),
+        tenureDays: existingGov.chiefMinister.tenureDays + 30,
+      };
+      cmName = cmProfile.name;
+    } else {
+      // New party took power: generate dynamic Chief Minister
+      const rulingPartyObj = campaign.politicalWorld.parties.find((p) => p.id === rulingPartyId);
+      cmProfile = generateDynamicChiefMinister(
+        stateId,
+        rulingPartyId,
+        rulingPartyObj?.name ?? rulingPartyId,
+      );
+      cmName = cmProfile.name;
+    }
+
+    const cabinetStability = postPollResolution.cabinetStability;
 
     // Calculate next 5-year term end
     const pollDate = new Date(election.date);
     pollDate.setUTCFullYear(pollDate.getUTCFullYear() + 5);
     const newTermEnd = pollDate.toISOString().slice(0, 10);
 
+    const totalCabinetPortfolios = Object.values(postPollResolution.cabinetPortfolios).reduce(
+      (a, b) => a + b,
+      0,
+    );
+
     const updatedGov: StateGovernment = {
       stateId,
       rulingPartyId,
       rulingAllianceId,
       chiefMinisterName: cmName,
+      chiefMinister: cmProfile,
+      cabinetStability,
+      cabinetSeats: totalCabinetPortfolios,
       governmentType,
       assemblyTermEnd: newTermEnd,
     };
@@ -306,7 +405,7 @@ export function simulateElection(
     date: election.date,
     category: "election",
     title: `Election Results: ${election.name}`,
-    description: `${largestParty?.party?.name ?? largestParty?.partyId} emerged as the single largest party with ${largestParty?.seats} seats out of ${totalSeats}. Government formed: ${governmentType.toUpperCase()} (CM: ${cmName}). Your party won ${playerSeatsWon} seat(s).`,
+    description: `${postPollResolution.bargainSummary} Your party won ${playerSeatsWon} seat(s).`,
     importance: "critical",
   };
 
@@ -322,12 +421,19 @@ export function simulateElection(
     return e;
   });
 
+  const existingBargains = campaign.politicalWorld.postPollBargains ?? [];
+  const updatedBargains = [
+    ...existingBargains.filter((b) => b.electionId !== electionId),
+    postPollResolution.postPollBargain,
+  ];
+
   return {
     ...campaign,
     politicalWorld: {
       ...campaign.politicalWorld,
       stateGovernments: updatedGovernments,
       constituencyControl: Array.from(updatedControlMap.values()),
+      postPollBargains: updatedBargains,
     },
     elections: updatedElections,
     history: {

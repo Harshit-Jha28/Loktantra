@@ -15,6 +15,10 @@ import {
   INDIA_WORLD_VERSION,
 } from "@/data/india2026";
 import { seedConstituencyControl } from "./seedConstituencyControl";
+import {
+  seedChiefMinisterForRegion,
+  calculateCabinetStability,
+} from "@/engine/governance/chiefMinisters";
 
 export interface CreateCampaignOptions {
   campaignName: string;
@@ -111,34 +115,46 @@ export function createCampaign(
     };
   });
 
-  const stateGovernments: StateGovernment[] = INDIA_REGIONS.map(
-    (region) => ({
+  const stateGovernments: StateGovernment[] = INDIA_REGIONS.map((region) => {
+    const cmProfile = seedChiefMinisterForRegion(region.id);
+    const majorityMark = Math.floor(region.assemblySeats / 2) + 1;
+    const stability = calculateCabinetStability(
+      region.governmentType,
+      region.assemblySeats > 0 ? majorityMark + 5 : 0,
+      majorityMark,
+      cmProfile,
+      region.allianceId ? 2 : 0,
+    );
+
+    return {
       stateId: region.id,
       rulingPartyId: region.rulingPartyId,
       rulingAllianceId: region.allianceId,
       chiefMinisterName: region.chiefMinisterName,
+      chiefMinister: cmProfile,
+      cabinetStability: stability,
+      cabinetSeats: Math.min(35, Math.max(12, Math.round(region.assemblySeats * 0.15))),
       governmentType: region.governmentType,
       assemblyTermEnd: INDIA_ASSEMBLY_TERM_ENDS[region.id] ?? null,
-    }),
-  );
+    };
+  });
 
-  // Add the fictional Chief Ministers to the campaign's leader registry.
-  const leaders: PoliticalLeader[] = INDIA_REGIONS
-    .filter(
-      (region) =>
-        region.chiefMinisterName !== null &&
-        region.rulingPartyId !== null,
-    )
-    .map((region) => ({
-      id: `leader-cm-${region.id}`,
-      partyId: region.rulingPartyId as string,
-      name: region.chiefMinisterName as string,
-      role: `Chief Minister · ${region.leaderArchetype ?? "consensus_builder"}`,
-      stateId: region.id,
-      popularity: 65,
-      experience: 70,
-      loyalty: 85,
-    }));
+  // Add the Chief Ministers to the campaign's leader registry.
+  const leaders: PoliticalLeader[] = stateGovernments
+    .filter((gov) => gov.chiefMinister !== null)
+    .map((gov) => {
+      const cm = gov.chiefMinister!;
+      return {
+        id: `leader-${cm.id}`,
+        partyId: cm.partyId,
+        name: cm.name,
+        role: `Chief Minister · ${cm.leaderArchetype.replace(/_/g, " ")}`,
+        stateId: gov.stateId,
+        popularity: cm.approvalRating,
+        experience: cm.experience,
+        loyalty: 85,
+      };
+    });
 
   // Initial baseline party treasuries for AI parties
   const treasuries: PartyTreasury[] = parties.map((party) => ({
@@ -161,14 +177,14 @@ export function createCampaign(
   const constituencyControl = seedConstituencyControl();
 
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
 
     metadata: {
       id: campaignId,
       campaignName: options.campaignName.trim(),
       createdAt: now,
       updatedAt: now,
-      gameVersion: `0.1.0+${INDIA_WORLD_VERSION}`,
+      gameVersion: `0.2.0+${INDIA_WORLD_VERSION}`,
     },
 
     calendar: {
@@ -194,6 +210,7 @@ export function createCampaign(
     organization: {
       members: [],
       leaders,
+      offices: [],
     },
 
     economy: {

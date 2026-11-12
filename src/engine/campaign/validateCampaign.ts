@@ -1,4 +1,3 @@
-
 import type { CampaignState } from "@/types/campaign";
 
 export function validateCampaign(
@@ -15,7 +14,7 @@ export function validateCampaign(
   const campaign = value as Record<string, unknown>;
 
   if (
-    campaign.schemaVersion !== 1 ||
+    (campaign.schemaVersion !== 1 && campaign.schemaVersion !== 2) ||
     typeof campaign.metadata !== "object" ||
     campaign.metadata === null ||
     typeof campaign.calendar !== "object" ||

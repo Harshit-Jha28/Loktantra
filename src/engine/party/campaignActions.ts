@@ -1,4 +1,8 @@
 import type { CampaignState, FinanceTransaction, CampaignEvent, PartyMember } from "@/types/campaign";
+import {
+  generateCadreBatch,
+  buildDistrictOffice,
+} from "@/engine/party/cadreSystem";
 
 export type PoliticalActionType =
   | "membership_drive"
@@ -20,29 +24,29 @@ export const POLITICAL_ACTIONS: PoliticalActionDefinition[] = [
     type: "membership_drive",
     name: "Grassroots Membership Drive",
     cost: 15000,
-    description: "Deploy youth volunteers and organizers to enroll registered voters into local party branch committees.",
-    effectSummary: "+75 to 150 active party members, +2 organization strength, +1 popularity.",
+    description: "Deploy youth organizers into neighborhoods to enroll registered voters and recruit grassroots volunteers into party committees.",
+    effectSummary: "+75 to 150 active party members, +5 dedicated volunteers, +2 organization strength, +1 popularity.",
   },
   {
     type: "district_office",
     name: "Open District Party Office",
     cost: 45000,
-    description: "Establish a permanent district headquarters with campaign staff, meeting hall, and communication center.",
-    effectSummary: "+5 organization strength, unlocks local constituency campaign capabilities.",
+    description: "Establish a permanent district headquarters in any chosen district across India with staff, meeting hall, and communication center.",
+    effectSummary: "Select any district in India, +5 organization strength, deploys 1 District Organizer and 3 active Cadre Workers.",
   },
   {
     type: "public_rally",
     name: "Organize Public Mass Rally",
     cost: 75000,
     description: "Erect a stage, hire sound systems, and mobilize thousands of citizens for a major speech by party leadership.",
-    effectSummary: "+3 to 5 popularity in state, boosts electoral vote share in upcoming polls.",
+    effectSummary: "+3 to 5 popularity in state, +4 grassroots cadre, boosts upcoming electoral vote share.",
   },
   {
     type: "media_campaign",
     name: "Launch State Press & Digital Campaign",
     cost: 60000,
     description: "Broadcast advertisements across regional newspapers, social channels, and local television networks.",
-    effectSummary: "+2 national popularity, elevates candidate visibility.",
+    effectSummary: "+2 national popularity, elevates candidate visibility across constituencies.",
   },
   {
     type: "policy_convention",
@@ -57,9 +61,17 @@ export function executePoliticalAction(
   campaign: CampaignState,
   actionType: PoliticalActionType,
   targetStateId?: string,
+  targetDistrictName?: string,
 ): { campaign: CampaignState; resultMessage: string } {
   if (!campaign.player.partyId) {
     throw new Error("You must establish your political party before taking actions.");
+  }
+
+  const stateId = targetStateId ?? campaign.player.foundingStateId;
+
+  // Delegate district office directly to buildDistrictOffice if district is specified
+  if (actionType === "district_office" && targetDistrictName) {
+    return buildDistrictOffice(campaign, stateId, targetDistrictName);
   }
 
   const actionDef = POLITICAL_ACTIONS.find((a) => a.type === actionType);
@@ -82,7 +94,6 @@ export function executePoliticalAction(
   }
 
   const newBalance = treasury.balance - actionDef.cost;
-  const stateId = targetStateId ?? campaign.player.foundingStateId;
 
   const transaction: FinanceTransaction = {
     id: crypto.randomUUID(),
@@ -90,7 +101,7 @@ export function executePoliticalAction(
     type: "expense",
     category: "campaign_action",
     amount: actionDef.cost,
-    description: `${actionDef.name} (${stateId})`,
+    description: `${actionDef.name} (${stateId}${targetDistrictName ? ` - ${targetDistrictName}` : ""})`,
     date: campaign.calendar.currentDate,
   };
 
@@ -114,35 +125,43 @@ export function executePoliticalAction(
       popularityGain = 1;
       electoralGain = 1;
 
-      // Add sample party members
-      const sampleNames = ["Ramesh Kumar", "Fatima Begum", "Pooja Sharma", "Sanjay Patel", "Deepak Das"];
-      for (let i = 0; i < Math.min(count, 5); i++) {
-        newMembers.push({
-          id: crypto.randomUUID(),
-          partyId: campaign.player.partyId,
-          name: sampleNames[i % sampleNames.length] + ` #${Math.floor(Math.random() * 900 + 100)}`,
-          role: "Grassroots Worker",
-          stateId,
-          constituencyId: null,
-          loyalty: Math.floor(70 + Math.random() * 25),
-          influence: Math.floor(20 + Math.random() * 40),
-          joinedAt: campaign.calendar.currentDate,
-        });
-      }
-      resultMessage = `Membership drive in ${stateId} enrolled ${count} new members into your movement!`;
+      // Generate authentic cadre volunteers in this state/district
+      newMembers = generateCadreBatch(
+        campaign.player.partyId,
+        stateId,
+        targetDistrictName ?? null,
+        "volunteer",
+        5,
+        campaign.calendar.currentDate,
+      );
+
+      resultMessage = `Grassroots membership drive in ${stateId} enrolled ${count} registered members and recruited 5 active volunteers into your local committees!`;
       break;
     }
     case "district_office": {
       orgStrengthGain = 5;
       electoralGain = 2;
-      resultMessage = `New district party office inaugurated in ${stateId}. Organizational reach expanded.`;
+      const district = targetDistrictName ?? "Central District";
+
+      // Generate 1 district organizer and 2 workers
+      const organizer = generateCadreBatch(campaign.player.partyId, stateId, district, "district_organizer", 1, campaign.calendar.currentDate);
+      const workers = generateCadreBatch(campaign.player.partyId, stateId, district, "worker", 2, campaign.calendar.currentDate);
+      newMembers = [...organizer, ...workers];
+
+      resultMessage = `New district party office inaugurated in ${district}, ${stateId}. Organizational reach expanded.`;
       break;
     }
     case "public_rally": {
       popularityGain = Math.floor(3 + Math.random() * 3);
       electoralGain = 3;
       orgStrengthGain = 1;
-      resultMessage = `Mass rally held in ${stateId} with thousands in attendance! Public enthusiasm is surging.`;
+
+      // Mass rally inspires 3 volunteers and 1 active worker
+      const volunteers = generateCadreBatch(campaign.player.partyId, stateId, targetDistrictName ?? null, "volunteer", 3, campaign.calendar.currentDate);
+      const worker = generateCadreBatch(campaign.player.partyId, stateId, targetDistrictName ?? null, "worker", 1, campaign.calendar.currentDate);
+      newMembers = [...volunteers, ...worker];
+
+      resultMessage = `Mass rally held in ${stateId} with thousands in attendance! Public enthusiasm is surging (+${popularityGain} popularity, 4 new volunteers enrolled).`;
       break;
     }
     case "media_campaign": {

@@ -1,10 +1,15 @@
-
 import type {
   CampaignState,
   PoliticalParty,
   PartyTreasury,
   CampaignEvent,
+  PartyDistrictOffice,
 } from "@/types/campaign";
+import { getDistrictsForState } from "@/data/indiaDistricts";
+import {
+  generateCadreBatch,
+  generateCadreMember,
+} from "@/engine/party/cadreSystem";
 
 export type PartyIdeology =
   | "Progressive"
@@ -54,6 +59,7 @@ export function createPlayerParty(
 
   const partyId = crypto.randomUUID();
   const foundingYear = Number(campaign.calendar.currentDate.slice(0, 4));
+  const foundingStateId = campaign.player.foundingStateId;
 
   const party: PoliticalParty = {
     id: partyId,
@@ -68,11 +74,11 @@ export function createPlayerParty(
       secondaryColor: input.secondaryColor,
     },
     foundedYear: foundingYear,
-    headquartersStateId: campaign.player.foundingStateId,
+    headquartersStateId: foundingStateId,
     allianceId: null,
-    organizationStrength: 1,
-    electoralStrength: 1,
-    popularity: 1,
+    organizationStrength: 5,
+    electoralStrength: 2,
+    popularity: 2,
     funds: 250000,
     isPlayerParty: true,
     isActive: true,
@@ -81,7 +87,70 @@ export function createPlayerParty(
   const treasury: PartyTreasury = {
     partyId,
     balance: 250000,
-    transactions: [],
+    transactions: [
+      {
+        id: crypto.randomUUID(),
+        partyId,
+        type: "income",
+        category: "founding_funds",
+        amount: 250000,
+        description: "Initial seed treasury from founding members",
+        date: campaign.calendar.currentDate,
+      },
+    ],
+  };
+
+  // Seed founding district and cadre committee
+  const stateDistricts = getDistrictsForState(foundingStateId);
+  const foundingDistrict = stateDistricts[0] ?? "Central District";
+
+  const foundingOrganizer = generateCadreMember(
+    partyId,
+    foundingStateId,
+    foundingDistrict,
+    "district_organizer",
+    campaign.calendar.currentDate
+  );
+  const foundingCoordinators = generateCadreBatch(
+    partyId,
+    foundingStateId,
+    foundingDistrict,
+    "booth_coordinator",
+    2,
+    campaign.calendar.currentDate
+  );
+  const foundingWorkers = generateCadreBatch(
+    partyId,
+    foundingStateId,
+    foundingDistrict,
+    "worker",
+    2,
+    campaign.calendar.currentDate
+  );
+  const foundingVolunteers = generateCadreBatch(
+    partyId,
+    foundingStateId,
+    foundingDistrict,
+    "volunteer",
+    3,
+    campaign.calendar.currentDate
+  );
+
+  const foundingCadre = [
+    foundingOrganizer,
+    ...foundingCoordinators,
+    ...foundingWorkers,
+    ...foundingVolunteers,
+  ];
+
+  const foundingOffice: PartyDistrictOffice = {
+    id: `office-${crypto.randomUUID()}`,
+    partyId,
+    stateId: foundingStateId,
+    districtName: foundingDistrict,
+    establishedDate: campaign.calendar.currentDate,
+    level: 2, // Headquarters
+    cadreCount: foundingCadre.length,
   };
 
   const event: CampaignEvent = {
@@ -89,7 +158,7 @@ export function createPlayerParty(
     date: campaign.calendar.currentDate,
     category: "party",
     title: `${abbreviation} has been founded!`,
-    description: `${name} has officially been established in ${campaign.player.foundingStateId}. Its political journey begins.`,
+    description: `${name} has officially been established with founding headquarters in ${foundingDistrict}, ${foundingStateId}. A founding committee of 8 dedicated cadre has been mobilized.`,
     importance: "high",
   };
 
@@ -109,6 +178,12 @@ export function createPlayerParty(
     politicalWorld: {
       ...campaign.politicalWorld,
       parties: [...campaign.politicalWorld.parties, party],
+    },
+
+    organization: {
+      ...campaign.organization,
+      members: [...campaign.organization.members, ...foundingCadre],
+      offices: [...(campaign.organization.offices ?? []), foundingOffice],
     },
 
     economy: {

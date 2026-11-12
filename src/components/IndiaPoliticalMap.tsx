@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { states as indiaStates } from "vardhan-maps/data";
+import { states as indiaStates, loadDistricts } from "vardhan-maps/data";
 import { useEffect, useMemo, useState } from "react";
 import {
   GeoJSON,
@@ -24,10 +24,13 @@ import {
   Award,
   AlertCircle,
   Calendar,
+  Layers,
 } from "lucide-react";
 import { useCampaignStore } from "@/engine/campaign/campaignStore";
 import type { CampaignState, PoliticalParty } from "@/types/campaign";
 import { INDIA_REGIONS, type RegionSeed } from "@/data/india2026";
+import StateAssemblyView from "@/components/map/StateAssemblyView";
+import StateParliamentaryView from "@/components/map/StateParliamentaryView";
 
 type StateProperties = {
   STNAME?: string;
@@ -82,6 +85,59 @@ function findRegionByName(name: string): RegionSeed | undefined {
   return INDIA_REGIONS.find(
     (r) => normaliseName(r.id) === norm || normaliseName(r.name) === norm,
   );
+}
+
+function computeFeatureCollectionBounds(features: Feature[]): [[number, number], [number, number]] | null {
+  let minLat = 90;
+  let maxLat = -90;
+  let minLng = 180;
+  let maxLng = -180;
+
+  function processCoords(coords: unknown) {
+    if (!Array.isArray(coords)) return;
+    if (typeof coords[0] === "number" && typeof coords[1] === "number") {
+      const [lng, lat] = coords as [number, number];
+      if (lat < minLat) minLat = lat;
+      if (lat > maxLat) maxLat = lat;
+      if (lng < minLng) minLng = lng;
+      if (lng > maxLng) maxLng = lng;
+    } else {
+      coords.forEach(processCoords);
+    }
+  }
+
+  for (const f of features) {
+    if (f.geometry && "coordinates" in f.geometry) {
+      processCoords((f.geometry as unknown as { coordinates: unknown }).coordinates);
+    }
+  }
+
+  if (minLat > maxLat || minLng > maxLng) return null;
+  return [[minLat, minLng], [maxLat, maxLng]];
+}
+
+function MapViewController({
+  bounds,
+  resetSignal,
+}: {
+  bounds: [[number, number], [number, number]] | null;
+  resetSignal: number;
+}) {
+  const map = useMap();
+
+  useEffect(() => {
+    if (resetSignal > 0) {
+      map.setView([22.5, 79], 4.5);
+    }
+  }, [resetSignal, map]);
+
+  useEffect(() => {
+    if (bounds) {
+      map.fitBounds(bounds, { padding: [30, 30], maxZoom: 8.5 });
+    }
+  }, [bounds, map]);
+
+  return null;
 }
 
 function MapZoomControls() {
@@ -180,6 +236,13 @@ export default function IndiaPoliticalMap() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
 
+  // Assembly drill-down mode states
+  const [viewMode, setViewMode] = useState<"national" | "assembly" | "parliamentary">("national");
+  const [districtGeoData, setDistrictGeoData] = useState<FeatureCollection | null>(null);
+  const [selectedDistrict, setSelectedDistrict] = useState<string | null>(null);
+  const [stateBounds, setStateBounds] = useState<[[number, number], [number, number]] | null>(null);
+  const [resetSignal, setResetSignal] = useState(0);
+
   useEffect(() => {
     let cancelled = false;
 
@@ -256,6 +319,53 @@ export default function IndiaPoliticalMap() {
         alliance.id === selectedGovernment.rulingAllianceId,
     );
   }, [campaign, selectedGovernment]);
+
+  // Load state district boundaries when entering assembly drill-down view
+  useEffect(() => {
+    if ((viewMode !== "assembly" && viewMode !== "parliamentary") || !selectedRegion) {
+      setDistrictGeoData(null);
+      setStateBounds(null);
+      return;
+    }
+
+    let cancelled = false;
+
+    async function loadStateDistricts() {
+      try {
+        const districts = await loadDistricts(selectedRegion!.name);
+        if (cancelled) return;
+
+        if (Array.isArray(districts) && districts.length > 0) {
+          const fc: FeatureCollection = {
+            type: "FeatureCollection",
+            features: districts as Feature[],
+          };
+          setDistrictGeoData(fc);
+          const bounds = computeFeatureCollectionBounds(districts as Feature[]);
+          if (bounds) setStateBounds(bounds);
+        } else {
+          // If no districts found for small UT, calculate from national state feature
+          if (geoData) {
+            const stateFeature = geoData.features.find(
+              (f) => normaliseName(getFeatureName(f)) === normaliseName(selectedRegion!.name),
+            );
+            if (stateFeature) {
+              const bounds = computeFeatureCollectionBounds([stateFeature as Feature]);
+              if (bounds) setStateBounds(bounds);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn("Could not load district geometries:", err);
+      }
+    }
+
+    loadStateDistricts();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [viewMode, selectedRegion, geoData]);
 
   // Assembly Seat Composition calculation from campaign.politicalWorld.constituencyControl
   const assemblySeatComposition = useMemo(() => {
@@ -463,7 +573,49 @@ export default function IndiaPoliticalMap() {
     `;
 
     layer.on({
-      click: () => setSelectedName(name),
+      click: () => {
+        setSelectedName(name);
+      },
+    });
+
+    layer.bindTooltip(tooltipText, {
+      direction: "auto",
+      sticky: true,
+      className: "india-map-tooltip",
+    });
+  }
+
+  function styleDistrictFeature(
+    feature?: Feature<Geometry, Record<string, unknown>>,
+  ): PathOptions {
+    const distName = (feature?.properties?.name as string) || "";
+    const isSelected = selectedDistrict && normaliseName(distName) === normaliseName(selectedDistrict);
+
+    return {
+      fillColor: isSelected ? "#D96B42" : "#EAD9B8",
+      fillOpacity: isSelected ? 0.85 : 0.55,
+      color: isSelected ? "#8C3925" : "#514235",
+      weight: isSelected ? 2.5 : 1.2,
+      opacity: 1,
+      lineJoin: "round",
+    };
+  }
+
+  function handleDistrictFeature(
+    feature: Feature<Geometry, Record<string, unknown>>,
+    layer: Layer,
+  ) {
+    const distName = (feature.properties?.name as string) || "District";
+
+    const tooltipText = `
+      <div style="font-weight: 900; font-size: 11px; margin-bottom: 2px;">District: ${distName}</div>
+      <div style="font-size: 9px; color: #8C5946;">Click to filter assembly constituencies</div>
+    `;
+
+    layer.on({
+      click: () => {
+        setSelectedDistrict((prev) => (prev === distName ? null : distName));
+      },
     });
 
     layer.bindTooltip(tooltipText, {
@@ -512,90 +664,73 @@ export default function IndiaPoliticalMap() {
     );
   }
 
-  const gameYear = new Date(
-    campaign.calendar.currentDate,
-  ).getFullYear();
-
-  const displayYear = Number.isNaN(gameYear) ? 2027 : gameYear;
-
-  // Active parties for legend
-  const activeParties = campaign.politicalWorld.parties.filter((p) => p.isActive);
+  const activeParties = campaign.politicalWorld.parties.filter(
+    (party) => party.isActive,
+  );
 
   return (
     <main className="political-map-screen">
       <header className="map-game-header">
         <Link className="map-back-button" href="/">
           <ArrowLeft size={16} />
-          MAIN MENU
+          COMMAND HQ
         </Link>
 
         <div className="map-brand">
           <span className="map-brand-emblem">L</span>
           <div>
             <strong>LOKTANTRA</strong>
-            <small>THE POLITICAL WORLD</small>
+            <small>THE POLITICAL WORLD · {formatGameDate(campaign.calendar.currentDate)}</small>
           </div>
         </div>
 
-        <div className="map-campaign-label">
-          <span>INDIA · {displayYear}</span>
-          <small>{campaign.metadata.campaignName}</small>
+        <div className="map-date-pill">
+          <span>TURN #{campaign.calendar.currentTurn}</span>
+          <span className="dot">·</span>
+          <span>{formatGameDate(campaign.calendar.currentDate)}</span>
         </div>
       </header>
 
-      <section className="map-page-heading">
+      <div className="map-overview-strip">
         <div>
-          <span className="board-kicker">THE POLITICAL LANDSCAPE</span>
-          <h1>THE MAP OF INDIA</h1>
+          <span className="board-kicker">STRATEGIC DISPATCH</span>
           <p>
-            Explore states and Union Territories. Inspect Legislative Assembly compositions,
-            ruling coalitions, and Lok Sabha allocations.
+            {(viewMode === "assembly" || viewMode === "parliamentary") && selectedRegion
+              ? `Legislative Assembly Delimitation Map: Inspecting ${selectedRegion.assemblySeats} constituencies of ${selectedRegion.name}.`
+              : "Explore the 36 states and Union Territories of India. Click any state to inspect its Legislative Assembly composition, ruling coalition, and chief minister."}
           </p>
         </div>
-        <div className="map-date-stamp">
-          <span>GAME DATE</span>
-          <strong>{formatGameDate(campaign.calendar.currentDate)}</strong>
-        </div>
-      </section>
 
-      <div className="map-layer-bar">
-        <div className="map-layer-title">
-          <MapPin size={16} />
-          GEOGRAPHICAL LAYERS
-        </div>
-
-        <div className="map-layer-options">
-          <button className="map-layer-active" type="button">
-            STATES &amp; UTs (36)
-          </button>
-          <button
-            type="button"
-            className="cursor-pointer"
-            onClick={() => {
-              if (selectedRegion) {
-                alert(`Assembly seat composition for ${selectedRegion.name} is displayed in the Field Intelligence panel.`);
-              } else {
-                alert("Click any state on the map to inspect its legislative assembly seats.");
-              }
-            }}
-          >
-            ASSEMBLY (4,123)
-            <small style={{ background: "#557C55" }}>LIVE SEATS</small>
-          </button>
-          <button
-            type="button"
-            className="cursor-pointer"
-            onClick={() => {
-              if (selectedRegion) {
-                alert(`Lok Sabha constituency share for ${selectedRegion.name} is displayed in the Field Intelligence panel.`);
-              } else {
-                alert("Click any state on the map to inspect its Lok Sabha seats.");
-              }
-            }}
-          >
-            LOK SABHA (543)
-            <small style={{ background: "#557C55" }}>LIVE SEATS</small>
-          </button>
+        <div className="map-strip-stats">
+          {(viewMode === "assembly" || viewMode === "parliamentary") && selectedRegion ? (
+            <button
+              type="button"
+              className="map-stat-pill"
+              onClick={() => {
+                setViewMode("national");
+                setSelectedDistrict(null);
+                setResetSignal((s) => s + 1);
+              }}
+              style={{ cursor: "pointer", background: "#E8D3AC" }}
+            >
+              ← RETURN TO INDIA MAP
+            </button>
+          ) : (
+            <>
+              <div className="map-stat-pill">
+                STATES &amp; UTS
+                <strong style={{ color: "#D96B42" }}>36</strong>
+              </div>
+              <div className="map-stat-pill">
+                ASSEMBLY SEATS
+                <strong style={{ color: "#8C5946" }}>4,123</strong>
+              </div>
+              <div className="map-stat-pill">
+                LOK SABHA
+                <strong style={{ color: "#557C55" }}>543</strong>
+              </div>
+            </>
+          )}
         </div>
       </div>
 
@@ -603,10 +738,20 @@ export default function IndiaPoliticalMap() {
         <div className="india-map-frame">
           <div className="map-frame-heading">
             <div>
-              <strong>REPUBLIC OF INDIA</strong>
-              <small>SELECT A STATE OR UNION TERRITORY TO INSPECT</small>
+              <strong>
+                {(viewMode === "assembly" || viewMode === "parliamentary") && selectedRegion
+                  ? `${selectedRegion.name.toUpperCase()} ASSEMBLY MAP`
+                  : "REPUBLIC OF INDIA"}
+              </strong>
+              <small>
+                {viewMode === "assembly"
+                  ? "DISTRICT DELIMITATION BOUNDARIES · CLICK A DISTRICT TO FILTER ACs"
+                  : "SELECT A STATE OR UNION TERRITORY TO INSPECT"}
+              </small>
             </div>
-            <span className="map-live-dot">LIVE SIMULATION MAP</span>
+            <span className="map-live-dot">
+              {viewMode === "assembly" ? "AC LEVEL VIEW" : viewMode === "parliamentary" ? "LOK SABHA PC VIEW" : "LIVE SIMULATION MAP"}
+            </span>
           </div>
 
           <div className="india-map-canvas">
@@ -641,12 +786,23 @@ export default function IndiaPoliticalMap() {
                 zoomControl={false}
                 className="india-leaflet-map"
               >
-                <GeoJSON
-                  key={`${selectedName}-${campaign.metadata.updatedAt}`}
-                  data={geoData}
-                  style={styleFeature}
-                  onEachFeature={handleFeature}
-                />
+                <MapViewController bounds={stateBounds} resetSignal={resetSignal} />
+
+                {(viewMode === "assembly" || viewMode === "parliamentary") && districtGeoData ? (
+                  <GeoJSON
+                    key={`districts-${selectedName}-${selectedDistrict}`}
+                    data={districtGeoData}
+                    style={styleDistrictFeature}
+                    onEachFeature={handleDistrictFeature}
+                  />
+                ) : (
+                  <GeoJSON
+                    key={`${selectedName}-${campaign.metadata.updatedAt}`}
+                    data={geoData}
+                    style={styleFeature}
+                    onEachFeature={handleFeature}
+                  />
+                )}
 
                 <MapZoomControls />
               </MapContainer>
@@ -696,361 +852,468 @@ export default function IndiaPoliticalMap() {
           </div>
 
           <div className="map-frame-footer">
-            <span>✦ CLICK ANY STATE TO VIEW ASSEMBLY &amp; PARLIAMENT SEATS</span>
+            <span>
+              {viewMode === "assembly"
+                ? "✦ CLICK DISTRICTS TO FILTER CONSTITUENCIES · DRILL DOWN ACTIVE"
+                : "✦ CLICK ANY STATE TO VIEW ASSEMBLY & PARLIAMENT SEATS"}
+            </span>
             <span>OFFLINE LOCAL GEOGRAPHY DATA · REAL DELIMITATION BOUNDARIES</span>
           </div>
         </div>
 
         <aside className="map-side-panel" style={{ maxHeight: "calc(100vh - 120px)", overflowY: "auto" }}>
-          <div className="map-panel-heading">
-            <div>
-              <span className="board-kicker">FIELD INTELLIGENCE</span>
-              <h2>{selectedName || "Select a State"}</h2>
-            </div>
-            {selectedName && (
-              <button
-                type="button"
-                className="clear-state-button"
-                aria-label="Clear selected state"
-                onClick={() => setSelectedName("")}
-              >
-                <X size={17} />
-              </button>
-            )}
-          </div>
-
-          {selectedName ? (
-            <div className="selected-region-content" style={{ marginTop: "12px" }}>
-              <div className="region-banner">
-                <span>📍</span>
+          {viewMode === "assembly" && selectedRegion ? (
+            <StateAssemblyView
+              campaign={campaign}
+              region={selectedRegion}
+              selectedDistrict={selectedDistrict}
+              onSelectDistrict={(dist) => setSelectedDistrict(dist)}
+              onBackToNational={() => {
+                setViewMode("national");
+                setSelectedDistrict(null);
+                setResetSignal((s) => s + 1);
+              }}
+              onSwitchToParliamentaryView={() => setViewMode("parliamentary")}
+            />
+          ) : viewMode === "parliamentary" && selectedRegion ? (
+            <StateParliamentaryView
+              campaign={campaign}
+              region={selectedRegion}
+              onBackToNational={() => {
+                setViewMode("national");
+                setSelectedDistrict(null);
+                setResetSignal((s) => s + 1);
+              }}
+              onSwitchToAssemblyView={() => setViewMode("assembly")}
+            />
+          ) : (
+            <>
+              <div className="map-panel-heading">
                 <div>
-                  <strong>{selectedName}</strong>
-                  <small>
-                    {selectedRegion ? `${selectedRegion.kind.toUpperCase().replace("_", " ")} · CAPITAL: ${selectedRegion.capital}` : "REGION"}
-                  </small>
+                  <span className="board-kicker">FIELD INTELLIGENCE</span>
+                  <h2>{selectedName || "Select a State"}</h2>
                 </div>
+                {selectedName && (
+                  <button
+                    type="button"
+                    className="clear-state-button"
+                    aria-label="Clear selected state"
+                    onClick={() => setSelectedName("")}
+                  >
+                    <X size={17} />
+                  </button>
+                )}
               </div>
 
-              {/* State Active Election Notice */}
-              {stateElection && (
-                <div
-                  style={{
-                    marginTop: "12px",
-                    padding: "10px 12px",
-                    background: "#FCEADE",
-                    border: "2px solid #D96B42",
-                    borderRadius: "4px",
-                  }}
-                >
-                  <div style={{ display: "flex", alignItems: "center", gap: "6px", color: "#A8492C", fontWeight: 900, fontSize: "10px" }}>
-                    <Vote size={15} />
-                    <span>ELECTION STATUS: {stateElection.status.toUpperCase()}</span>
-                  </div>
-                  <p style={{ margin: "4px 0 0", fontSize: "11px", color: "#34495E" }}>
-                    <strong>{stateElection.name}</strong>
-                  </p>
-                  <p style={{ margin: "2px 0 0", fontSize: "10px", color: "#8C5946" }}>
-                    Polling scheduled on: {formatGameDate(stateElection.date)}
-                  </p>
-                </div>
-              )}
-
-              {/* Legislative Assembly Composition Panel */}
-              {assemblySeatComposition ? (
-                <div
-                  style={{
-                    marginTop: "14px",
-                    padding: "12px",
-                    background: "#F8F1E3",
-                    border: "2px solid #8C5946",
-                    borderRadius: "4px",
-                  }}
-                >
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <span className="board-kicker" style={{ display: "flex", alignItems: "center", gap: "5px" }}>
-                      <Landmark size={13} />
-                      VIDHAN SABHA (ASSEMBLY)
-                    </span>
-                    <span style={{ fontSize: "10px", fontWeight: 900, color: "#34495E" }}>
-                      {assemblySeatComposition.totalSeats} SEATS
-                    </span>
+              {selectedName ? (
+                <div className="selected-region-content" style={{ marginTop: "12px" }}>
+                  <div className="region-banner">
+                    <span>📍</span>
+                    <div>
+                      <strong>{selectedName}</strong>
+                      <small>
+                        {selectedRegion ? `${selectedRegion.kind.toUpperCase().replace("_", " ")} · CAPITAL: ${selectedRegion.capital}` : "REGION"}
+                      </small>
+                    </div>
                   </div>
 
-                  <div style={{ marginTop: "6px", display: "flex", justifyContent: "space-between", fontSize: "11px" }}>
-                    <span>Majority Mark: <strong>{assemblySeatComposition.majorityMark}</strong> seats</span>
-                    <span
+                  {/* Prominent Assembly Drilldown Button */}
+                  {selectedRegion && selectedRegion.assemblySeats > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setViewMode("assembly")}
                       style={{
-                        padding: "2px 6px",
-                        borderRadius: "3px",
-                        fontSize: "9px",
+                        marginTop: "12px",
+                        width: "100%",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        gap: "6px",
+                        background: "#D96B42",
+                        color: "#FFF",
                         fontWeight: 900,
-                        background: assemblySeatComposition.hasMajority ? "#E2EDDC" : "#FCEADE",
-                        color: assemblySeatComposition.hasMajority ? "#557C55" : "#D96B42",
-                        border: `1px solid ${assemblySeatComposition.hasMajority ? "#557C55" : "#D96B42"}`,
+                        fontSize: "11px",
+                        letterSpacing: "0.5px",
+                        padding: "9px 12px",
+                        border: "2px solid var(--ink)",
+                        borderRadius: "3px",
+                        cursor: "pointer",
+                        boxShadow: "0 2px 4px rgba(0,0,0,0.15)",
                       }}
                     >
-                      {assemblySeatComposition.hasMajority ? "MAJORITY SECURED" : "HUNG / MINORITY"}
-                    </span>
-                  </div>
+                      <Layers size={15} />
+                      EXPLORE ASSEMBLY CONSTITUENCIES ({selectedRegion.assemblySeats} SEATS)
+                    </button>
+                  )}
 
-                  {/* Horizontal Seat Distribution Bar */}
-                  <div
-                    style={{
-                      marginTop: "10px",
-                      height: "22px",
-                      display: "flex",
-                      width: "100%",
-                      borderRadius: "3px",
-                      overflow: "hidden",
-                      border: "2px solid #34495E",
-                      position: "relative",
-                      background: "#E8D3AC",
-                    }}
-                  >
-                    {assemblySeatComposition.partyStats.map((stat) => (
-                      <div
-                        key={stat.party.id}
-                        title={`${stat.party.name} (${stat.party.abbreviation}): ${stat.seats} seats (${stat.percentage}%)`}
-                        style={{
-                          width: `${(stat.seats / assemblySeatComposition.totalSeats) * 100}%`,
-                          backgroundColor: stat.party.branding.primaryColor,
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "center",
-                          color: "#FFF",
-                          fontSize: "9px",
-                          fontWeight: 900,
-                          textShadow: "0 1px 2px rgba(0,0,0,0.6)",
-                          borderRight: "1px solid rgba(0,0,0,0.2)",
-                        }}
-                      >
-                        {stat.seats >= 3 ? stat.party.abbreviation : ""}
-                      </div>
-                    ))}
-                    {/* Majority Marker Indicator */}
-                    <div
-                      title={`Majority threshold: ${assemblySeatComposition.majorityMark} seats`}
+                  {/* Prominent Parliamentary Drilldown Button */}
+                  {selectedRegion && selectedRegion.lokSabhaSeats > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setViewMode("parliamentary")}
                       style={{
-                        position: "absolute",
-                        left: `${(assemblySeatComposition.majorityMark / assemblySeatComposition.totalSeats) * 100}%`,
-                        top: 0,
-                        bottom: 0,
-                        width: "2px",
-                        backgroundColor: "#000",
-                        zIndex: 2,
-                        boxShadow: "0 0 2px #fff",
+                        marginTop: "8px",
+                        width: "100%",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        gap: "6px",
+                        background: "#557C55",
+                        color: "#FFF",
+                        fontWeight: 900,
+                        fontSize: "11px",
+                        letterSpacing: "0.5px",
+                        padding: "9px 12px",
+                        border: "2px solid var(--ink)",
+                        borderRadius: "3px",
+                        cursor: "pointer",
+                        boxShadow: "0 2px 4px rgba(0,0,0,0.15)",
                       }}
-                    />
-                  </div>
+                    >
+                      <Vote size={15} />
+                      EXPLORE PARLIAMENTARY SEATS ({selectedRegion.lokSabhaSeats} LOK SABHA)
+                    </button>
+                  )}
 
-                  {/* Party breakdown list */}
-                  <div style={{ marginTop: "10px", display: "flex", flexDirection: "column", gap: "6px" }}>
-                    {assemblySeatComposition.partyStats.map((stat) => (
-                      <div
-                        key={stat.party.id}
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          justifyContent: "space-between",
-                          fontSize: "10px",
-                          padding: "4px 6px",
-                          background: "#FFFDF6",
-                          border: "1px solid #D6B995",
-                          borderRadius: "2px",
-                        }}
-                      >
-                        <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
-                          <span
-                            style={{
-                              width: "10px",
-                              height: "10px",
-                              borderRadius: "2px",
-                              backgroundColor: stat.party.branding.primaryColor,
-                              border: "1px solid #34495E",
-                            }}
-                          />
-                          <strong>{stat.party.abbreviation}</strong>
-                          <span style={{ color: "#666", fontSize: "9px" }}>
-                            {stat.isRuling ? "(Ruling)" : stat.isCoalitionPartner ? "(Coalition)" : "(Opposition)"}
-                          </span>
-                        </div>
-                        <div style={{ fontWeight: 900 }}>
-                          {stat.seats} seats <span style={{ color: "#8C5946", fontWeight: 400 }}>({stat.percentage}%)</span>
-                        </div>
+                  {/* State Active Election Notice */}
+                  {stateElection && (
+                    <div
+                      style={{
+                        marginTop: "12px",
+                        padding: "10px 12px",
+                        background: "#FCEADE",
+                        border: "2px solid #D96B42",
+                        borderRadius: "4px",
+                      }}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", gap: "6px", color: "#A8492C", fontWeight: 900, fontSize: "10px" }}>
+                        <Vote size={15} />
+                        <span>ELECTION STATUS: {stateElection.status.toUpperCase()}</span>
                       </div>
-                    ))}
-                  </div>
-                </div>
-              ) : selectedRegion && selectedRegion.assemblySeats === 0 ? (
-                <div style={{ marginTop: "12px", padding: "10px", background: "#F2E5CD", borderLeft: "3px solid #8C5946", fontSize: "11px" }}>
-                  <strong>Union Territory without Legislative Assembly</strong>
-                  <p style={{ margin: "4px 0 0", color: "#655548", fontSize: "10px" }}>
-                    Directly administered by the President through an appointed Administrator or Lieutenant Governor.
-                  </p>
-                </div>
-              ) : null}
+                      <p style={{ margin: "4px 0 0", fontSize: "11px", color: "#34495E" }}>
+                        <strong>{stateElection.name}</strong>
+                      </p>
+                      <p style={{ margin: "2px 0 0", fontSize: "10px", color: "#8C5946" }}>
+                        Polling scheduled on: {formatGameDate(stateElection.date)}
+                      </p>
+                    </div>
+                  )}
 
-              {/* Lok Sabha Composition for State */}
-              {lokSabhaSeatComposition && (
-                <div
-                  style={{
-                    marginTop: "12px",
-                    padding: "10px 12px",
-                    background: "#F8F1E3",
-                    border: "1px solid #D6B995",
-                    borderRadius: "4px",
-                  }}
-                >
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                    <span className="board-kicker" style={{ display: "flex", alignItems: "center", gap: "5px" }}>
-                      <Vote size={13} />
-                      LOK SABHA (PARLIAMENT)
-                    </span>
-                    <span style={{ fontSize: "10px", fontWeight: 900, color: "#34495E" }}>
-                      {lokSabhaSeatComposition.totalSeats} SEATS
-                    </span>
-                  </div>
+                  {/* Legislative Assembly Composition Panel */}
+                  {assemblySeatComposition ? (
+                    <div
+                      style={{
+                        marginTop: "14px",
+                        padding: "12px",
+                        background: "#F8F1E3",
+                        border: "2px solid #8C5946",
+                        borderRadius: "4px",
+                      }}
+                    >
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                        <span className="board-kicker" style={{ display: "flex", alignItems: "center", gap: "5px" }}>
+                          <Landmark size={13} />
+                          VIDHAN SABHA (ASSEMBLY)
+                        </span>
+                        <span style={{ fontSize: "10px", fontWeight: 900, color: "#34495E" }}>
+                          {assemblySeatComposition.totalSeats} SEATS
+                        </span>
+                      </div>
 
-                  <div style={{ marginTop: "8px", display: "flex", flexWrap: "wrap", gap: "6px" }}>
-                    {lokSabhaSeatComposition.partyStats.map((p) => (
-                      <span
-                        key={p.partyId}
-                        style={{
-                          display: "inline-flex",
-                          alignItems: "center",
-                          gap: "4px",
-                          padding: "3px 7px",
-                          background: "#FFFDF6",
-                          border: "1px solid #D6B995",
-                          borderRadius: "3px",
-                          fontSize: "10px",
-                          fontWeight: 700,
-                        }}
-                      >
+                      <div style={{ marginTop: "6px", display: "flex", justifyContent: "space-between", fontSize: "11px" }}>
+                        <span>Majority Mark: <strong>{assemblySeatComposition.majorityMark}</strong> seats</span>
                         <span
                           style={{
-                            width: "8px",
-                            height: "8px",
-                            borderRadius: "50%",
-                            backgroundColor: p.color,
+                            padding: "2px 6px",
+                            borderRadius: "3px",
+                            fontSize: "9px",
+                            fontWeight: 900,
+                            background: assemblySeatComposition.hasMajority ? "#E2EDDC" : "#FCEADE",
+                            color: assemblySeatComposition.hasMajority ? "#557C55" : "#D96B42",
+                            border: `1px solid ${assemblySeatComposition.hasMajority ? "#557C55" : "#D96B42"}`,
+                          }}
+                        >
+                          {assemblySeatComposition.hasMajority ? "MAJORITY SECURED" : "HUNG / MINORITY"}
+                        </span>
+                      </div>
+
+                      {/* Horizontal Seat Distribution Bar */}
+                      <div
+                        style={{
+                          marginTop: "10px",
+                          height: "22px",
+                          display: "flex",
+                          width: "100%",
+                          borderRadius: "3px",
+                          overflow: "hidden",
+                          border: "2px solid #34495E",
+                          position: "relative",
+                          background: "#E8D3AC",
+                        }}
+                      >
+                        {assemblySeatComposition.partyStats.map((stat) => (
+                          <div
+                            key={stat.party.id}
+                            title={`${stat.party.name} (${stat.party.abbreviation}): ${stat.seats} seats (${stat.percentage}%)`}
+                            style={{
+                              width: `${(stat.seats / assemblySeatComposition.totalSeats) * 100}%`,
+                              backgroundColor: stat.party.branding.primaryColor,
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "center",
+                              color: "#FFF",
+                              fontSize: "9px",
+                              fontWeight: 900,
+                              textShadow: "0 1px 2px rgba(0,0,0,0.6)",
+                              borderRight: "1px solid rgba(0,0,0,0.2)",
+                            }}
+                          >
+                            {stat.seats >= 3 ? stat.party.abbreviation : ""}
+                          </div>
+                        ))}
+                        {/* Majority Marker Indicator */}
+                        <div
+                          title={`Majority threshold: ${assemblySeatComposition.majorityMark} seats`}
+                          style={{
+                            position: "absolute",
+                            left: `${(assemblySeatComposition.majorityMark / assemblySeatComposition.totalSeats) * 100}%`,
+                            top: 0,
+                            bottom: 0,
+                            width: "2px",
+                            backgroundColor: "#000",
+                            zIndex: 2,
+                            boxShadow: "0 0 2px #fff",
                           }}
                         />
-                        {p.abbreviation}: <strong>{p.seats}</strong>
-                      </span>
-                    ))}
+                      </div>
+
+                      {/* Party breakdown list */}
+                      <div style={{ marginTop: "10px", display: "flex", flexDirection: "column", gap: "6px" }}>
+                        {assemblySeatComposition.partyStats.map((stat) => (
+                          <div
+                            key={stat.party.id}
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "space-between",
+                              fontSize: "10px",
+                              padding: "4px 6px",
+                              background: "#FFFDF6",
+                              border: "1px solid #D6B995",
+                              borderRadius: "2px",
+                            }}
+                          >
+                            <div style={{ display: "flex", alignItems: "center", gap: "6px" }}>
+                              <span
+                                style={{
+                                  width: "10px",
+                                  height: "10px",
+                                  borderRadius: "2px",
+                                  backgroundColor: stat.party.branding.primaryColor,
+                                  border: "1px solid #34495E",
+                                }}
+                              />
+                              <strong>{stat.party.abbreviation}</strong>
+                              <span style={{ color: "#666", fontSize: "9px" }}>
+                                {stat.isRuling ? "(Ruling)" : stat.isCoalitionPartner ? "(Coalition)" : "(Opposition)"}
+                              </span>
+                            </div>
+                            <div style={{ fontWeight: 900 }}>
+                              {stat.seats} seats <span style={{ color: "#8C5946", fontWeight: 400 }}>({stat.percentage}%)</span>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : selectedRegion && selectedRegion.assemblySeats === 0 ? (
+                    <div style={{ marginTop: "12px", padding: "10px", background: "#F2E5CD", borderLeft: "3px solid #8C5946", fontSize: "11px" }}>
+                      <strong>Union Territory without Legislative Assembly</strong>
+                      <p style={{ margin: "4px 0 0", color: "#655548", fontSize: "10px" }}>
+                        Directly administered by the President through an appointed Administrator or Lieutenant Governor.
+                      </p>
+                    </div>
+                  ) : null}
+
+                  {/* Lok Sabha Composition for State */}
+                  {lokSabhaSeatComposition && (
+                    <div
+                      style={{
+                        marginTop: "12px",
+                        padding: "10px 12px",
+                        background: "#F8F1E3",
+                        border: "1px solid #D6B995",
+                        borderRadius: "4px",
+                      }}
+                    >
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                        <span className="board-kicker" style={{ display: "flex", alignItems: "center", gap: "5px" }}>
+                          <Vote size={13} />
+                          LOK SABHA (PARLIAMENT)
+                        </span>
+                        <span style={{ fontSize: "10px", fontWeight: 900, color: "#34495E" }}>
+                          {lokSabhaSeatComposition.totalSeats} SEATS
+                        </span>
+                      </div>
+
+                      <div style={{ marginTop: "8px", display: "flex", flexWrap: "wrap", gap: "6px" }}>
+                        {lokSabhaSeatComposition.partyStats.map((p) => (
+                          <span
+                            key={p.partyId}
+                            style={{
+                              display: "inline-flex",
+                              alignItems: "center",
+                              gap: "4px",
+                              padding: "3px 7px",
+                              background: "#FFFDF6",
+                              border: "1px solid #D6B995",
+                              borderRadius: "3px",
+                              fontSize: "10px",
+                              fontWeight: 700,
+                            }}
+                          >
+                            <span
+                              style={{
+                                width: "8px",
+                                height: "8px",
+                                borderRadius: "50%",
+                                backgroundColor: p.color,
+                              }}
+                            />
+                            {p.abbreviation}: <strong>{p.seats}</strong>
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Government Details */}
+                  <div className="region-intelligence">
+                    <span className="board-kicker">GOVERNANCE INTELLIGENCE</span>
+
+                    <div className="intelligence-row">
+                      <span>Ruling Party</span>
+                      <strong>
+                        {selectedRulingParty?.name || "Not configured"}
+                      </strong>
+                    </div>
+
+                    {selectedAlliance && (
+                      <div className="intelligence-row">
+                        <span>Ruling Alliance</span>
+                        <strong>{selectedAlliance.name} ({selectedAlliance.abbreviation})</strong>
+                      </div>
+                    )}
+
+                    <div className="intelligence-row">
+                      <span>Chief Minister</span>
+                      <strong>
+                        {selectedGovernment?.chiefMinisterName || "Not configured"}
+                      </strong>
+                    </div>
+
+                    {selectedGovernment?.chiefMinister && (
+                      <>
+                        <div className="intelligence-row">
+                          <span>CM Archetype</span>
+                          <strong style={{ textTransform: "capitalize" }}>
+                            {selectedGovernment.chiefMinister.leaderArchetype.replace(/_/g, " ")}
+                          </strong>
+                        </div>
+                        <div className="intelligence-row">
+                          <span>CM Approval</span>
+                          <strong style={{ color: "#557C55" }}>
+                            {selectedGovernment.chiefMinister.approvalRating}%
+                          </strong>
+                        </div>
+                      </>
+                    )}
+
+                    {selectedGovernment?.cabinetStability !== undefined && (
+                      <div className="intelligence-row">
+                        <span>Cabinet Stability</span>
+                        <strong style={{ color: selectedGovernment.cabinetStability >= 70 ? "#557C55" : "#D97706" }}>
+                          {selectedGovernment.cabinetStability}%
+                        </strong>
+                      </div>
+                    )}
+
+                    <div className="intelligence-row">
+                      <span>Government Type</span>
+                      <strong style={{ textTransform: "capitalize" }}>
+                        {selectedGovernment?.governmentType
+                          ? selectedGovernment.governmentType.replace(/_/g, " ")
+                          : "Not configured"}
+                      </strong>
+                    </div>
+
+                    <div className="intelligence-row">
+                      <span>Assembly Term Ends</span>
+                      <strong>
+                        {selectedGovernment?.assemblyTermEnd
+                          ? formatGameDate(selectedGovernment.assemblyTermEnd)
+                          : "Not configured"}
+                      </strong>
+                    </div>
                   </div>
+
+                  <Link
+                    href="/"
+                    className="primary-button"
+                    style={{
+                      textDecoration: "none",
+                      marginTop: "16px",
+                      fontSize: "11px",
+                    }}
+                  >
+                    RETURN TO HEADQUARTERS
+                  </Link>
+                </div>
+              ) : (
+                <div className="map-empty-selection">
+                  <div className="empty-map-illustration">🗺️</div>
+                  <h3>The nation awaits.</h3>
+                  <p>
+                    Click any state or Union Territory on the map to inspect its
+                    Legislative Assembly composition, ruling coalition, and parliamentary seats.
+                  </p>
                 </div>
               )}
 
-              {/* Government Details */}
-              <div className="region-intelligence">
-                <span className="board-kicker">GOVERNANCE INTELLIGENCE</span>
+              <div className="region-search">
+                <label htmlFor="stateSearch">
+                  <Search size={15} />
+                  FIND A STATE OR UNION TERRITORY
+                </label>
+                <input
+                  id="stateSearch"
+                  value={search}
+                  onChange={(event) => setSearch(event.target.value)}
+                  placeholder="Search by state name..."
+                />
+                <div className="region-search-results">
+                  {filteredFeatures.slice(0, 10).map((feature, index) => {
+                    const name = getFeatureName(feature);
 
-                <div className="intelligence-row">
-                  <span>Ruling Party</span>
-                  <strong>
-                    {selectedRulingParty?.name || "Not configured"}
-                  </strong>
-                </div>
-
-                {selectedAlliance && (
-                  <div className="intelligence-row">
-                    <span>Ruling Alliance</span>
-                    <strong>{selectedAlliance.name} ({selectedAlliance.abbreviation})</strong>
-                  </div>
-                )}
-
-                <div className="intelligence-row">
-                  <span>Chief Minister</span>
-                  <strong>
-                    {selectedGovernment?.chiefMinisterName || "Not configured"}
-                  </strong>
-                </div>
-
-                {selectedRegion?.leaderArchetype && (
-                  <div className="intelligence-row">
-                    <span>Leader Archetype</span>
-                    <strong style={{ textTransform: "capitalize" }}>
-                      {selectedRegion.leaderArchetype.replace(/_/g, " ")}
-                    </strong>
-                  </div>
-                )}
-
-                <div className="intelligence-row">
-                  <span>Government Type</span>
-                  <strong style={{ textTransform: "capitalize" }}>
-                    {selectedGovernment?.governmentType
-                      ? selectedGovernment.governmentType.replace(/_/g, " ")
-                      : "Not configured"}
-                  </strong>
-                </div>
-
-                <div className="intelligence-row">
-                  <span>Assembly Term Ends</span>
-                  <strong>
-                    {selectedGovernment?.assemblyTermEnd
-                      ? formatGameDate(selectedGovernment.assemblyTermEnd)
-                      : "Not configured"}
-                  </strong>
+                    return (
+                      <button
+                        key={`${name}-${index}`}
+                        type="button"
+                        onClick={() => selectState(name)}
+                        className={
+                          normaliseName(name) === normaliseName(selectedName)
+                            ? "search-result-selected"
+                            : ""
+                        }
+                      >
+                        <MapPin size={13} />
+                        {name}
+                      </button>
+                    );
+                  })}
                 </div>
               </div>
-
-              <Link
-                href="/"
-                className="primary-button"
-                style={{
-                  textDecoration: "none",
-                  marginTop: "16px",
-                  fontSize: "11px",
-                }}
-              >
-                RETURN TO HEADQUARTERS
-              </Link>
-            </div>
-          ) : (
-            <div className="map-empty-selection">
-              <div className="empty-map-illustration">🗺️</div>
-              <h3>The nation awaits.</h3>
-              <p>
-                Click any state or Union Territory on the map to inspect its
-                Legislative Assembly composition, ruling coalition, and parliamentary seats.
-              </p>
-            </div>
+            </>
           )}
-
-          <div className="region-search">
-            <label htmlFor="stateSearch">
-              <Search size={15} />
-              FIND A STATE OR UNION TERRITORY
-            </label>
-            <input
-              id="stateSearch"
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-              placeholder="Search by state name..."
-            />
-            <div className="region-search-results">
-              {filteredFeatures.slice(0, 10).map((feature, index) => {
-                const name = getFeatureName(feature);
-
-                return (
-                  <button
-                    key={`${name}-${index}`}
-                    type="button"
-                    onClick={() => selectState(name)}
-                    className={
-                      normaliseName(name) === normaliseName(selectedName)
-                        ? "search-result-selected"
-                        : ""
-                    }
-                  >
-                    <MapPin size={13} />
-                    {name}
-                  </button>
-                );
-              })}
-            </div>
-          </div>
         </aside>
       </section>
 

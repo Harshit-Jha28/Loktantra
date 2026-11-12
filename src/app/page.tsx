@@ -30,6 +30,9 @@ import {
   FileText,
   Globe,
   Sparkles,
+  Flame,
+  Handshake,
+  ShieldAlert,
 } from "lucide-react";
 
 import { useCampaignStore } from "@/engine/campaign/campaignStore";
@@ -59,6 +62,13 @@ import {
   simulateElection,
   nominateCandidate,
 } from "@/engine/elections/electionEngine";
+import CadreManagementView from "@/components/campaign/CadreManagementView";
+import DistrictOfficeModal from "@/components/campaign/DistrictOfficeModal";
+import CandidateNominationModal from "@/components/campaign/CandidateNominationModal";
+import TicketDistributionModal from "@/components/campaign/TicketDistributionModal";
+import CoalitionNegotiationModal from "@/components/campaign/CoalitionNegotiationModal";
+import PartyDisciplineModal from "@/components/campaign/PartyDisciplineModal";
+import StateParliamentaryView from "@/components/map/StateParliamentaryView";
 
 type Ideology = {
   name: PartyIdeology;
@@ -137,8 +147,10 @@ export default function Home() {
   >("menu");
 
   const [hqTab, setHqTab] = useState<
-    "actions" | "leaders" | "elections" | "parliament" | "policies" | "history"
+    "actions" | "cadre" | "leaders" | "elections" | "parliament" | "policies" | "history"
   >("actions");
+  const [isOfficeModalOpen, setIsOfficeModalOpen] = useState(false);
+  const [isDisciplineModalOpen, setIsDisciplineModalOpen] = useState(false);
 
   const campaign = useCampaignStore((state) => state.campaign);
   const hasUnsavedChanges = useCampaignStore((state) => state.hasUnsavedChanges);
@@ -165,7 +177,11 @@ export default function Home() {
   const [message, setMessage] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Nomination form state in elections tab
+  // Nomination modal & Parliamentary drill-down state
+  const [nominationModalElectionId, setNominationModalElectionId] = useState<string | null>(null);
+  const [ticketModalElectionId, setTicketModalElectionId] = useState<string | null>(null);
+  const [coalitionModalElectionId, setCoalitionModalElectionId] = useState<string | null>(null);
+  const [selectedParliamentStateId, setSelectedParliamentStateId] = useState<string | null>(null);
   const [nomCandidateName, setNomCandidateName] = useState("");
   const [selectedElectionId, setSelectedElectionId] = useState<string>("");
 
@@ -261,6 +277,11 @@ export default function Home() {
       partyStats: stats,
     };
   }, [campaign]);
+
+  const selectedParliamentRegion = useMemo(() => {
+    if (!selectedParliamentStateId) return null;
+    return INDIA_REGIONS.find((r) => r.id === selectedParliamentStateId) ?? null;
+  }, [selectedParliamentStateId]);
 
   function createCampaign() {
     if (!campaignName.trim()) {
@@ -1115,6 +1136,20 @@ export default function Home() {
               ✊ POLITICAL ACTIONS
             </button>
             <button
+              onClick={() => setHqTab("cadre")}
+              style={{
+                padding: "10px 18px",
+                border: "2px solid #34495E",
+                borderBottom: hqTab === "cadre" ? "2px solid #F5E6C8" : "2px solid #34495E",
+                background: hqTab === "cadre" ? "#F5E6C8" : "#E8D3AC",
+                fontWeight: 900,
+                fontSize: 11,
+                cursor: "pointer",
+              }}
+            >
+              👥 CADRE &amp; VOLUNTEERS ({campaign.organization.members.filter((m) => m.partyId === party.id).length})
+            </button>
+            <button
               onClick={() => setHqTab("leaders")}
               style={{
                 padding: "10px 18px",
@@ -1250,7 +1285,13 @@ export default function Home() {
                         className="primary-button"
                         style={{ marginTop: 14, padding: "10px" }}
                         disabled={!canAfford}
-                        onClick={() => handleTakeAction(act.type)}
+                        onClick={() => {
+                          if (act.type === "district_office") {
+                            setIsOfficeModalOpen(true);
+                          } else {
+                            handleTakeAction(act.type);
+                          }
+                        }}
                       >
                         {canAfford ? `EXECUTE ACTION (₹${act.cost.toLocaleString("en-IN")})` : "INSUFFICIENT FUNDS"}
                       </button>
@@ -1261,15 +1302,35 @@ export default function Home() {
             </div>
           )}
 
+          {/* TAB CONTENT: CADRE & VOLUNTEERS */}
+          {hqTab === "cadre" && (
+            <CadreManagementView
+              campaign={campaign}
+              onUpdateCampaign={(updated, msg) => {
+                updateCampaign(() => updated);
+                if (msg) setMessage(msg);
+              }}
+            />
+          )}
+
           {/* TAB CONTENT: LEADERS */}
           {hqTab === "leaders" && (
             <div className="paper-panel" style={{ padding: 24 }}>
-              <div style={{ marginBottom: 18 }}>
-                <span className="board-kicker">PARTY LEADERSHIP COMMITTEE</span>
-                <h2 style={{ margin: "4px 0 0", fontFamily: "Georgia, serif" }}>Recruit Political Leaders</h2>
-                <p style={{ margin: "4px 0 0", fontSize: 12, color: "var(--ink-soft)" }}>
-                  Leaders bring distinct political perks, improve candidate popularity, and broker post-election coalitions.
-                </p>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 18 }}>
+                <div>
+                  <span className="board-kicker">PARTY LEADERSHIP COMMITTEE</span>
+                  <h2 style={{ margin: "4px 0 0", fontFamily: "Georgia, serif" }}>Recruit Political Leaders</h2>
+                  <p style={{ margin: "4px 0 0", fontSize: 12, color: "var(--ink-soft)" }}>
+                    Leaders bring distinct political perks, improve candidate popularity, and broker post-election coalitions.
+                  </p>
+                </div>
+                <button
+                  className="primary-button"
+                  style={{ marginTop: 0, padding: "8px 16px", background: "#7D2E1E" }}
+                  onClick={() => setIsDisciplineModalOpen(true)}
+                >
+                  <ShieldAlert size={15} /> PARTY DISCIPLINE &amp; DEFECTIONS
+                </button>
               </div>
 
               {/* Recruited Leaders Section */}
@@ -1399,7 +1460,9 @@ export default function Home() {
                 </div>
               ) : (
                 <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
-                  {campaign.elections.map((elec) => {
+                  {campaign.elections
+                    .filter((elec, idx, arr) => arr.findIndex((e) => e.id === elec.id) === idx)
+                    .map((elec) => {
                     const region = elec.stateId ? INDIA_REGIONS.find((r) => r.id === elec.stateId) : null;
                     const isCompleted = elec.status === "completed";
                     const isPolling = elec.status === "polling";
@@ -1441,14 +1504,45 @@ export default function Home() {
                           </div>
 
                           {/* Action Buttons for election */}
-                          <div style={{ display: "flex", gap: 8 }}>
-                            {!isCompleted && (
+                          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                            {!isCompleted ? (
+                              <>
+                                <button
+                                  className="primary-button"
+                                  style={{ marginTop: 0, padding: "8px 14px", background: "#2E5266" }}
+                                  onClick={() => setCoalitionModalElectionId(elec.id)}
+                                >
+                                  <Handshake size={15} /> COALITION &amp; SEAT-SHARING
+                                </button>
+                                <button
+                                  className="primary-button"
+                                  style={{ marginTop: 0, padding: "8px 14px", background: "#7D2E1E" }}
+                                  onClick={() => setTicketModalElectionId(elec.id)}
+                                >
+                                  <Flame size={15} /> TICKET ALLOCATION &amp; REBELS
+                                </button>
+                                <button
+                                  className="primary-button"
+                                  style={{ marginTop: 0, padding: "8px 14px", background: "#34495E" }}
+                                  onClick={() => setNominationModalElectionId(elec.id)}
+                                >
+                                  <Users size={15} /> CANDIDATE DIRECTORY &amp; NOMINATIONS
+                                </button>
+                                <button
+                                  className="primary-button"
+                                  style={{ marginTop: 0, padding: "8px 14px", background: "#D96B42" }}
+                                  onClick={() => handleSimulateElection(elec.id)}
+                                >
+                                  <Vote size={15} /> SIMULATE POLLING &amp; RESULTS
+                                </button>
+                              </>
+                            ) : (
                               <button
                                 className="primary-button"
-                                style={{ marginTop: 0, padding: "8px 14px", background: "#D96B42" }}
-                                onClick={() => handleSimulateElection(elec.id)}
+                                style={{ marginTop: 0, padding: "6px 14px", background: "#2E5266", fontSize: 11 }}
+                                onClick={() => setCoalitionModalElectionId(elec.id)}
                               >
-                                <Vote size={15} /> SIMULATE POLLING &amp; RESULTS
+                                <Handshake size={14} /> VIEW POST-POLL BARGAIN &amp; CABINET
                               </button>
                             )}
                           </div>
@@ -1456,31 +1550,36 @@ export default function Home() {
 
                         {/* Candidate Nomination Section (if active) */}
                         {!isCompleted && (
-                          <div style={{ marginTop: 14, paddingTop: 12, borderTop: "1px dashed #D6B995", display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
-                            <span style={{ fontSize: 11, fontWeight: 700 }}>Nominate Party Candidate:</span>
-                            <input
-                              className="game-input"
-                              style={{ maxWidth: 220, minHeight: 36, padding: "6px 10px", fontSize: 11 }}
-                              placeholder="Candidate Name"
-                              value={selectedElectionId === elec.id ? nomCandidateName : ""}
-                              onChange={(e) => {
-                                setSelectedElectionId(elec.id);
-                                setNomCandidateName(e.target.value);
-                              }}
-                            />
+                          <div
+                            style={{
+                              marginTop: 14,
+                              paddingTop: 12,
+                              borderTop: "1px dashed #D6B995",
+                              display: "flex",
+                              justifyContent: "space-between",
+                              alignItems: "center",
+                              flexWrap: "wrap",
+                              gap: 10,
+                            }}
+                          >
+                            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                              <span style={{ fontSize: 12, fontWeight: 700, color: "#2C3E50" }}>
+                                Party Candidates Fielded:
+                              </span>
+                              <strong style={{ fontSize: 13, color: "#D96B42" }}>
+                                {elec.candidates.filter((c) => c.partyId === party.id).length} of {region?.assemblySeats ?? 543} seats
+                              </strong>
+                              <span style={{ fontSize: 11, color: "var(--ink-soft)" }}>
+                                (Security deposits paid: ₹{(elec.candidates.filter((c) => c.partyId === party.id).length * (elec.type === "lok_sabha" ? 10000 : 5000)).toLocaleString("en-IN")})
+                              </span>
+                            </div>
                             <button
                               className="primary-button"
-                              style={{ marginTop: 0, padding: "8px 14px", width: "auto" }}
-                              onClick={() => {
-                                const sampleSeat = elec.stateId ? `${elec.stateId}-ac-1` : "pc-1";
-                                handleNominateCandidate(elec.id, sampleSeat);
-                              }}
+                              style={{ marginTop: 0, padding: "6px 14px", width: "auto", fontSize: 11, background: "#557C55" }}
+                              onClick={() => setNominationModalElectionId(elec.id)}
                             >
-                              NOMINATE IN SEAT #1
+                              FIELD CANDIDATES / SCOUT
                             </button>
-                            <span style={{ fontSize: 10, color: "var(--ink-soft)" }}>
-                              (Nominated: {elec.candidates.filter((c) => c.partyId === party.id).length} candidates)
-                            </span>
                           </div>
                         )}
 
@@ -1521,6 +1620,36 @@ export default function Home() {
                     );
                   })}
                 </div>
+              )}
+
+              {/* Candidate Nomination Directory Modal */}
+              {nominationModalElectionId && (
+                <CandidateNominationModal
+                  isOpen={Boolean(nominationModalElectionId)}
+                  electionId={nominationModalElectionId}
+                  onClose={() => setNominationModalElectionId(null)}
+                  onSuccess={(msg) => setMessage(msg)}
+                />
+              )}
+
+              {/* Ticket Allocation & Rebel Management Modal */}
+              {ticketModalElectionId && (
+                <TicketDistributionModal
+                  isOpen={Boolean(ticketModalElectionId)}
+                  electionId={ticketModalElectionId}
+                  onClose={() => setTicketModalElectionId(null)}
+                  onSuccess={(msg) => setMessage(msg)}
+                />
+              )}
+
+              {/* Coalition Negotiation & Seat-Sharing Modal */}
+              {coalitionModalElectionId && (
+                <CoalitionNegotiationModal
+                  isOpen={Boolean(coalitionModalElectionId)}
+                  electionId={coalitionModalElectionId}
+                  onClose={() => setCoalitionModalElectionId(null)}
+                  onSuccess={(msg) => setMessage(msg)}
+                />
               )}
             </div>
           )}
@@ -1641,6 +1770,69 @@ export default function Home() {
                   </div>
                 ))}
               </div>
+
+              {/* State-by-State Parliamentary Constituencies Drill-down */}
+              {selectedParliamentRegion ? (
+                <div style={{ marginTop: 24, paddingTop: 18, borderTop: "2px solid #E2D7C3" }}>
+                  <StateParliamentaryView
+                    campaign={campaign}
+                    region={selectedParliamentRegion}
+                    onBackToNational={() => setSelectedParliamentStateId(null)}
+                  />
+                </div>
+              ) : (
+                <div style={{ marginTop: 24, paddingTop: 18, borderTop: "2px solid #E2D7C3" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
+                    <div>
+                      <h3 style={{ margin: 0, fontSize: 16, fontFamily: "Georgia, serif" }}>
+                        Explore All 543 Parliamentary Constituencies by State / UT
+                      </h3>
+                      <p style={{ margin: "2px 0 0", fontSize: 11, color: "var(--ink-soft)" }}>
+                        Select any state below to inspect its Lok Sabha seats, reservation categories, incumbent MPs, and ground Assembly segments.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(180px, 1fr))", gap: 8 }}>
+                    {INDIA_REGIONS.map((r) => (
+                      <button
+                        key={r.id}
+                        type="button"
+                        onClick={() => setSelectedParliamentStateId(r.id)}
+                        style={{
+                          padding: "8px 10px",
+                          backgroundColor: "#FFFDF6",
+                          border: "1px solid #D6B995",
+                          borderRadius: 3,
+                          cursor: "pointer",
+                          textAlign: "left",
+                          display: "flex",
+                          justifyContent: "space-between",
+                          alignItems: "center",
+                          transition: "all 0.15s ease",
+                        }}
+                      >
+                        <div>
+                          <strong style={{ display: "block", fontSize: 12, color: "#2C3E50" }}>{r.name}</strong>
+                          <span style={{ fontSize: 10, color: "#8C5946" }}>{r.kind === "union_territory" ? "UT" : "State"}</span>
+                        </div>
+                        <span
+                          style={{
+                            padding: "2px 6px",
+                            background: "#34495E",
+                            color: "#FFF",
+                            borderRadius: 2,
+                            fontSize: 10,
+                            fontWeight: 800,
+                          }}
+                        >
+                          {r.lokSabhaSeats} LS
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -1767,6 +1959,24 @@ export default function Home() {
               </div>
             </div>
           )}
+
+                    {/* District Office Building Modal */}
+          <DistrictOfficeModal
+            campaign={campaign}
+            isOpen={isOfficeModalOpen}
+            onClose={() => setIsOfficeModalOpen(false)}
+            onOfficeBuilt={(updated, msg) => {
+              updateCampaign(() => updated);
+              setMessage(msg);
+            }}
+          />
+
+          {/* Party Discipline & Defections Modal */}
+          <PartyDisciplineModal
+            isOpen={isDisciplineModalOpen}
+            onClose={() => setIsDisciplineModalOpen(false)}
+            onSuccess={(msg) => setMessage(msg)}
+          />
 
           {/* Footer Navigation Bar */}
           <div className="hq-footer" style={{ marginTop: 25, padding: "12px 0", borderTop: "1px dashed #BBA47D" }}>

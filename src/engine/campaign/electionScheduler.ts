@@ -79,9 +79,18 @@ export function runElectionScheduler(
 ): CampaignState {
     const today = campaign.calendar.currentDate;
 
-    const elections: Election[] = [
-        ...campaign.elections,
-    ];
+    // Deduplicate elections defensively (preserving completed results over duplicates)
+    const electionMap = new Map<string, Election>();
+    for (const election of campaign.elections) {
+        const existing = electionMap.get(election.id);
+        if (!existing) {
+            electionMap.set(election.id, election);
+        } else if (existing.status !== "completed" && election.status === "completed") {
+            electionMap.set(election.id, election);
+        }
+    }
+
+    const elections: Election[] = Array.from(electionMap.values());
 
     // --------------------------------------------------
     // 1. Assembly election scheduling
@@ -102,9 +111,10 @@ export function runElectionScheduler(
                 (item) => item.stateId === stateId,
             );
 
+        // Always check updated government term end first (e.g. 5-year extension after election)
         const termEnd =
-            INDIA_ASSEMBLY_TERM_ENDS[stateId] ??
             government?.assemblyTermEnd ??
+            INDIA_ASSEMBLY_TERM_ENDS[stateId] ??
             null;
 
         if (!termEnd) {
@@ -155,6 +165,19 @@ export function runElectionScheduler(
             continue;
         }
 
+        // Check if an election already exists for this state and date or with this ID
+        const prospectiveId = caretaker
+            ? `early-vidhan-sabha-${stateId}-${today}`
+            : `vidhan-sabha-${stateId}-${pollingDate}`;
+
+        const alreadyScheduled = elections.some(
+            (e) => e.id === prospectiveId || (e.type === "vidhan_sabha" && e.stateId === stateId && e.date === pollingDate)
+        );
+
+        if (alreadyScheduled && existingIndex === -1) {
+            continue;
+        }
+
         // Create a new election when it enters the notice window.
         if (existingIndex === -1) {
             if (
@@ -166,14 +189,10 @@ export function runElectionScheduler(
 
             elections.push(
                 createElection({
-                    id: caretaker
-                        ? `early-vidhan-sabha-${stateId}-${today}`
-                        : `vidhan-sabha-${stateId}-${pollingDate}`,
-
+                    id: prospectiveId,
                     name: caretaker
                         ? `Early Assembly Election — ${region.name}`
                         : `${region.name} Legislative Assembly Election`,
-
                     type: "vidhan_sabha",
                     stateId,
                     date: pollingDate,

@@ -59,6 +59,21 @@ export function advanceDay(
     }
   }
 
+  // Gradual cadre experience accumulation and development
+  let updatedMembers = campaign.organization.members;
+  if (days >= 1 && campaign.player.partyId) {
+    const expGain = Math.max(1, Math.floor(days / 3));
+    updatedMembers = campaign.organization.members.map((m) => {
+      if (m.partyId === campaign.player.partyId) {
+        return {
+          ...m,
+          experience: Math.min(95, (m.experience ?? 20) + expGain),
+        };
+      }
+      return m;
+    });
+  }
+
   let intermediateCampaign: CampaignState = {
     ...campaign,
     metadata: {
@@ -73,6 +88,10 @@ export function advanceDay(
     politicalWorld: {
       ...campaign.politicalWorld,
       parties: updatedParties,
+    },
+    organization: {
+      ...campaign.organization,
+      members: updatedMembers,
     },
     economy: {
       ...campaign.economy,
@@ -98,8 +117,8 @@ export function advanceDay(
   for (const election of intermediateCampaign.elections) {
     if (election.status !== "completed") {
       const isPastOrToday = formattedDate >= election.date;
+
       if (isPastOrToday) {
-        // Run polling simulation and government formation
         intermediateCampaign = simulateElection(intermediateCampaign, election.id);
       }
     }
